@@ -24,7 +24,16 @@ type Promise[T any] struct {
 	createdAt time.Time
 }
 
-// newPromise creates a new promise
+// newPromise creates a new Promise object to represent an in-progress download operation.
+// It initializes the promise with a key identifier and sets up the synchronization primitives.
+//
+// Parameters:
+//   - key: A unique identifier for the download operation
+//
+// Returns a new Promise object ready to track the download operation.
+//
+// This function is used internally by the Downloader to create promises for
+// tracking in-progress downloads and enabling the single-flight pattern.
 func newPromise[T any](key string) *Promise[T] {
 	p := &Promise[T]{
 		key:       key,
@@ -78,7 +87,18 @@ func (p *Promise[T]) WaitForCompletion(ctx context.Context) (T, error) {
 	}
 }
 
-// setResult sets the download result and notifies waiters
+// setResult sets the download result or error and notifies all waiting goroutines.
+// It stores either the result or error using unsafe.Pointer for type-safe generic storage.
+//
+// Parameters:
+//   - result: The downloaded data (only used if err is nil)
+//   - err: Any error that occurred during download (nil if successful)
+//
+// This method is called when a download completes (successfully or with an error).
+// It uses sync.Cond.Broadcast to wake up all goroutines waiting on this promise.
+// If the promise is already marked as done, this method is a no-op to prevent overwriting results.
+//
+// Thread safety: This method acquires the promise's mutex to ensure thread-safe updates.
 func (p *Promise[T]) setResult(result T, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -97,7 +117,15 @@ func (p *Promise[T]) setResult(result T, err error) {
 	p.cond.Broadcast()
 }
 
-// isDone returns whether the promise is completed
+// isDone checks if the promise has completed (either successfully or with an error).
+//
+// Returns true if the download operation has completed, false otherwise.
+//
+// This method is used primarily by the cleanup routine to determine if a promise
+// can be safely removed from the promises map when it has timed out but hasn't completed.
+// It's also used internally to check promise state.
+//
+// Thread safety: This method acquires the promise's mutex to ensure a consistent view of the done flag.
 func (p *Promise[T]) isDone() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -204,7 +232,18 @@ func (sf *Downloader[T]) GetCached(key string) (T, bool) {
 	return zero, false
 }
 
-// performDownload executes the actual download
+// performDownload executes the actual download operation for a promise.
+// It calls the user-provided downloadFunc and sets the result on the promise.
+//
+// Parameters:
+//   - ctx: Context for the download operation (can be used for cancellation)
+//   - promise: The Promise object representing this download operation
+//
+// This method is called as a goroutine when a new download is initiated.
+// It's responsible for the actual data retrieval and for notifying waiters
+// when the download completes by calling setResult on the promise.
+//
+// The method is profiled to track performance metrics of download operations.
 func (sf *Downloader[T]) performDownload(ctx context.Context, promise *Promise[T]) {
 	timer := profiling.Start(PerformDownload)
 	defer timer.End()
@@ -213,7 +252,15 @@ func (sf *Downloader[T]) performDownload(ctx context.Context, promise *Promise[T
 	promise.setResult(result, err)
 }
 
-// cleanupRoutine removes expired promises
+// cleanupRoutine is a background goroutine that periodically removes expired promises.
+// It runs on the interval specified by cleanupInterval and continues until the downloader is shut down.
+//
+// This method is started automatically when the Downloader is created and is responsible for
+// preventing memory leaks by ensuring old promises don't accumulate indefinitely.
+// It calls cleanupExpiredPromises at regular intervals to do the actual cleanup work.
+//
+// The goroutine exits gracefully when the Downloader's Shutdown method is called,
+// signaling via the stopCleanup channel and notifying the wait group when complete.
 func (sf *Downloader[T]) cleanupRoutine() {
 	defer sf.wg.Done()
 
@@ -230,7 +277,18 @@ func (sf *Downloader[T]) cleanupRoutine() {
 	}
 }
 
-// cleanupExpiredPromises removes old completed promises
+// cleanupExpiredPromises identifies and removes old completed promises from the promises map.
+// It only removes promises that are both completed (done) and older than the configured timeout.
+//
+// This method is called periodically by the cleanupRoutine to maintain memory efficiency.
+// It uses sync.Map.Range to safely iterate over the promises map without locking the entire map.
+// Only promises that meet both criteria (completed and expired) are removed:
+//  1. The promise must be done (completed successfully or with an error)
+//  2. The promise must be older than promiseTimeout
+//
+// The method is profiled to track performance metrics of cleanup operations.
+// In-progress promises are never removed, even if they exceed the timeout,
+// to prevent disrupting ongoing downloads.
 func (sf *Downloader[T]) cleanupExpiredPromises() {
 	timer := profiling.Start(CleanupExpiredPromises)
 	defer timer.End()

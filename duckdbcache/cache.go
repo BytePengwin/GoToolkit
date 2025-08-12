@@ -157,6 +157,20 @@ func (c *S3VersionedDataCache) GetVersionConnMultiplexed(versionFolder string) (
 	return c.connPool.GetMultiplexedConnection(versionFolder, dbPath)
 }
 
+// ensureVersionAvailable checks if a version is available locally and downloads it if needed.
+// It implements a memory cache to avoid repeated filesystem checks and uses a single-flight
+// pattern to prevent multiple concurrent downloads of the same version.
+//
+// Parameters:
+//   - versionFolder: The name of the version folder to ensure is available
+//
+// Returns:
+//   - The local path where the version is stored
+//   - An error if the version couldn't be ensured (e.g., download failed)
+//
+// This method is called by GetVersionConn and GetVersionConnMultiplexed to ensure
+// the requested version is available locally before returning a database connection.
+// It updates the last accessed time for cache entries to support the LRU cleanup mechanism.
 func (c *S3VersionedDataCache) ensureVersionAvailable(versionFolder string) (string, error) {
 	// Fast path: check memory cache first
 	c.cacheLock.RLock()
@@ -193,6 +207,24 @@ func (c *S3VersionedDataCache) ensureVersionAvailable(versionFolder string) (str
 	return localPath, nil
 }
 
+// downloadVersion downloads a specific version folder from S3 to the local cache directory.
+// It lists all objects in the S3 bucket with the given version folder prefix, downloads
+// all .db files, and verifies the downloaded files are valid.
+//
+// Parameters:
+//   - ctx: Context for the download operation (can be used for cancellation)
+//   - versionFolder: The name of the version folder to download
+//
+// Returns:
+//   - The local path where the version was downloaded
+//   - An error if the download or verification failed
+//
+// This method is called by the singleFlightDownloader when a version needs to be downloaded.
+// It creates the necessary local directory structure, downloads all database files,
+// and verifies the integrity of the downloaded files. If verification fails, it cleans up
+// the partially downloaded files.
+//
+// The method is profiled to track performance metrics of download operations.
 func (c *S3VersionedDataCache) downloadVersion(ctx context.Context, versionFolder string) (string, error) {
 	timer := profiling.Start(CacheDownload)
 	defer timer.End()
@@ -247,6 +279,21 @@ func (c *S3VersionedDataCache) downloadVersion(ctx context.Context, versionFolde
 	return localVersionPath, nil
 }
 
+// verifyVersionFolder checks if a downloaded version folder contains valid database files.
+// It performs two checks:
+// 1. Verifies that database.db exists and is not empty
+// 2. Attempts to open the database to ensure it's a valid DuckDB file
+//
+// Parameters:
+//   - folderPath: The local path to the version folder to verify
+//
+// Returns:
+//   - true if the folder contains valid database files, false otherwise
+//   - an error if one occurred during verification
+//
+// This method is called after downloading a version to ensure the downloaded files
+// are valid and usable. It helps prevent corrupted or incomplete downloads from
+// being used, which could cause application errors.
 func (c *S3VersionedDataCache) verifyVersionFolder(folderPath string) (bool, error) {
 	dbFile := filepath.Join(folderPath, "database.db")
 	if stat, err := os.Stat(dbFile); err != nil || stat.Size() == 0 {
@@ -394,6 +441,16 @@ func (c *S3VersionedDataCache) CleanupExpired() error {
 	return nil
 }
 
+// startCleanupRoutine initializes and starts a background goroutine that periodically
+// cleans up expired cache entries. It runs on a 5-second interval and continues
+// until the cache is shut down.
+//
+// This method is called during cache initialization to ensure automatic cleanup
+// of expired cache entries. It creates a ticker and a stop channel, then starts
+// a goroutine that calls CleanupExpired at regular intervals.
+//
+// The cleanup routine helps prevent the cache from growing too large by removing
+// entries that haven't been accessed within the configured TTL period.
 func (c *S3VersionedDataCache) startCleanupRoutine() {
 	c.cleanupTicker = time.NewTicker(5 * time.Second)
 	c.stopCleanup = make(chan struct{})
@@ -412,6 +469,20 @@ func (c *S3VersionedDataCache) startCleanupRoutine() {
 	}()
 }
 
+// initTimespansDB initializes the timespans database that maps version folders to their
+// corresponding start dates. It creates a local DuckDB database file and ensures the
+// necessary table structure exists.
+//
+// Returns an error if the database initialization fails.
+//
+// This method is called during cache initialization to set up the timespans tracking system.
+// It performs the following steps:
+//  1. Opens or creates a local DuckDB database file for timespans
+//  2. Creates the timespans table if it doesn't exist
+//  3. Attempts to pull existing timespan data from S3
+//
+// The timespans database is used to track the time periods covered by each version folder,
+// which can be useful for applications that need to query data based on time ranges.
 func (c *S3VersionedDataCache) initTimespansDB() error {
 	var err error
 	c.timespansDB, err = sql.Open("duckdb", filepath.Join(c.localCacheDir, "timespans.db"))
