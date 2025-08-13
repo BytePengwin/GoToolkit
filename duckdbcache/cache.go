@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	singleflight "github.com/BytePengwin/GoToolkit/singleflight"
+	"github.com/BytePengwin/GoToolkit/singleflight"
 	"io"
 	"io/fs"
 	"os"
@@ -13,11 +13,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	_ "github.com/marcboeker/go-duckdb"
 
 	"github.com/BytePengwin/GoToolkit/connectionpool"
@@ -35,9 +36,9 @@ type S3VersionedDataCache struct {
 	localCacheDir string
 	cacheTTL      time.Duration
 
-	s3Client    *s3.S3
-	uploader    *s3manager.Uploader
-	downloader  *s3manager.Downloader
+	s3Client    *s3.Client
+	uploader    *manager.Uploader
+	downloader  *manager.Downloader
 	timespansDB *sql.DB
 
 	// In-memory cache
@@ -68,28 +69,45 @@ func NewS3VersionedDataCache(s3Bucket, localCacheDir string, cacheTTL time.Durat
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	// Configure AWS session
-	config := &aws.Config{
-		Region:           aws.String("us-east-1"),
-		S3ForcePathStyle: aws.Bool(true),
-	}
+	// Configure AWS SDK
+	ctx := context.Background()
+	var opts []func(*config.LoadOptions) error
 
+	// Set region
+	opts = append(opts, config.WithRegion("us-east-1"))
+
+	// Set endpoint if provided
 	if endpointURL != "" {
-		config.Endpoint = aws.String(endpointURL)
+		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               endpointURL,
+				HostnameImmutable: true,
+				SigningRegion:     "us-east-1",
+			}, nil
+		})
+		opts = append(opts, config.WithEndpointResolverWithOptions(customResolver))
 	}
 
+	// Set credentials if provided
 	if accessKey != "" && secretKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(accessKey, secretKey, "")
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")))
 	}
 
-	sess, err := session.NewSession(config)
+	// Force path style for S3
+	opts = append(opts, config.WithDefaultsMode(aws.DefaultsModeInRegion))
+
+	// Load the configuration
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create AWS session: %w", err)
+		return nil, fmt.Errorf("failed to load AWS configuration: %w", err)
 	}
 
-	s3Client := s3.New(sess)
-	uploader := s3manager.NewUploader(sess)
-	downloader := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) {
+	// Create S3 client and transfer manager
+	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+	uploader := manager.NewUploader(s3Client)
+	downloader := manager.NewDownloader(s3Client, func(d *manager.Downloader) {
 		d.PartSize = 64 * 1024 * 1024
 		d.Concurrency = 10
 	})
@@ -240,7 +258,7 @@ func (c *S3VersionedDataCache) downloadVersion(ctx context.Context, versionFolde
 		Prefix: aws.String(versionFolder + "/"),
 	}
 
-	result, err := c.s3Client.ListObjectsV2(input)
+	result, err := c.s3Client.ListObjectsV2(ctx, input)
 	if err != nil {
 		return "", err
 	}
@@ -255,7 +273,7 @@ func (c *S3VersionedDataCache) downloadVersion(ctx context.Context, versionFolde
 				return "", err
 			}
 
-			_, err = c.downloader.Download(file, &s3.GetObjectInput{
+			_, err = c.downloader.Download(ctx, file, &s3.GetObjectInput{
 				Bucket: aws.String(c.s3Bucket),
 				Key:    obj.Key,
 			})
@@ -370,11 +388,11 @@ func (c *S3VersionedDataCache) UploadVersion(localFolderPath, versionFolder stri
 			}
 
 			s3Key := fmt.Sprintf("%s/%s", versionFolder, fileName)
-			_, err = c.uploader.Upload(&s3manager.UploadInput{
+			_, err = c.uploader.Upload(context.Background(), &s3.PutObjectInput{
 				Bucket:       aws.String(c.s3Bucket),
 				Key:          aws.String(s3Key),
 				Body:         sourceFile,
-				StorageClass: aws.String("STANDARD"),
+				StorageClass: types.StorageClassStandard,
 			})
 
 			stat, _ := sourceFile.Stat()
@@ -518,7 +536,7 @@ func (c *S3VersionedDataCache) PullTimespansFromS3() error {
 	defer file.Close()
 	defer os.Remove(timespansFile)
 
-	_, err = c.downloader.Download(file, &s3.GetObjectInput{
+	_, err = c.downloader.Download(context.Background(), file, &s3.GetObjectInput{
 		Bucket: aws.String(c.s3Bucket),
 		Key:    aws.String("timespans.db"),
 	})
@@ -564,11 +582,11 @@ func (c *S3VersionedDataCache) UpdateTimespans(folderName string, startDate time
 	}
 	defer file.Close()
 
-	_, err = c.uploader.Upload(&s3manager.UploadInput{
+	_, err = c.uploader.Upload(context.Background(), &s3.PutObjectInput{
 		Bucket:       aws.String(c.s3Bucket),
 		Key:          aws.String("timespans.db"),
 		Body:         file,
-		StorageClass: aws.String("STANDARD"),
+		StorageClass: types.StorageClassStandard,
 	})
 	return err
 }
